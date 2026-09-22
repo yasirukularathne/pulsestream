@@ -1,4 +1,5 @@
 from producers.event_timing import generate_event_timestamps
+from producers.event_emitter import prepare_events
 from producers.vitals_generator import generate_vitals
 
 
@@ -27,6 +28,8 @@ def generate_patient_events(
             event_ts=event_ts,
         )
 
-        events.append(event)
+        emitted_events = prepare_events(event, rng)
+
+        events.extend(emitted_events)
 
     return events

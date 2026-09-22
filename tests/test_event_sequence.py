@@ -24,10 +24,10 @@ def test_generate_patient_events_count():
         random.Random(42),
     )
 
-    assert len(events) == 10
+    assert len(events) >= 10
 
 
-def test_generate_patient_events_have_sequential_timestamps():
+def test_generate_patient_events_have_non_decreasing_timestamps():
     start_ts = datetime(
         2026,
         9,
@@ -54,10 +54,10 @@ def test_generate_patient_events_have_sequential_timestamps():
             current["timestamp"] - previous["timestamp"]
         ).total_seconds()
 
-        assert 3 <= difference <= 8
+        assert 0 <= difference <= 8
 
 
-def test_generate_patient_events_have_unique_event_ids():
+def test_duplicate_events_have_same_event_id():
     start_ts = datetime(
         2026,
         9,
@@ -79,4 +79,31 @@ def test_generate_patient_events_have_unique_event_ids():
 
     event_ids = [event["event_id"] for event in events]
 
-    assert len(event_ids) == len(set(event_ids))
+    assert len(event_ids) > len(set(event_ids))
+
+
+def test_unique_event_ids_represent_original_events():
+    start_ts = datetime(
+        2026,
+        9,
+        22,
+        12,
+        0,
+        0,
+        tzinfo=timezone.utc,
+    )
+
+    events = generate_patient_events(
+        "P0001",
+        80,
+        98,
+        start_ts,
+        10,
+        random.Random(42),
+    )
+
+    event_ids = [event["event_id"] for event in events]
+
+    unique_event_ids = set(event_ids)
+
+    assert len(unique_event_ids) == 10

@@ -35,13 +35,11 @@ metastore_db/
 airflow/logs/
 airflow/__pycache__/
 
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
 # Generated files
 *.tmp
 *.temp
-
-# Pytest
-.pytest_cache/
-
-# Coverage
-.coverage
-htmlcov/

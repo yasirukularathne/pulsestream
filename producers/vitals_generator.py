@@ -14,6 +14,7 @@ def generate_vitals(
     baseline_hr,
     baseline_spo2,
     rng=None,
+    event_ts=None,
 ):
     rng = rng or random
 
@@ -40,7 +41,10 @@ def generate_vitals(
     if rng.random() < INVALID_PROBABILITY:
         vitals = apply_invalid_value(vitals, rng)
 
-    metadata = create_event_metadata(patient_id)
+    metadata = create_event_metadata(
+    patient_id,
+    event_ts=event_ts,
+)
 
     vitals.update(metadata)
 

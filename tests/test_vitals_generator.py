@@ -1,5 +1,5 @@
 from producers.vitals_generator import generate_vitals
-
+from datetime import datetime, timezone
 
 def test_generate_vitals_is_deterministic():
     result1 = generate_vitals(
@@ -81,3 +81,24 @@ def test_invalid_event_probability():
     invalid_rate = invalid_count / total_events
 
     assert 0.01 <= invalid_rate <= 0.025
+
+def test_generate_vitals_accepts_custom_timestamp():
+    event_ts = datetime(
+        2026,
+        9,
+        22,
+        12,
+        0,
+        0,
+        tzinfo=timezone.utc,
+    )
+
+    result = generate_vitals(
+        "P0001",
+        80,
+        98,
+        __import__("random").Random(42),
+        event_ts=event_ts,
+    )
+
+    assert result["timestamp"] == event_ts

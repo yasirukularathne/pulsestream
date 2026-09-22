@@ -34,3 +34,30 @@ def test_generate_vitals_is_deterministic():
     )
 
     assert result1 == result2
+
+
+def test_abnormal_event_probability():
+    import random
+
+    abnormal_count = 0
+    total_events = 1000
+
+    for _ in range(total_events):
+        result = generate_vitals(
+            "P0001",
+            80,
+            98,
+            random.Random(_),
+        )
+
+        if (
+            result["heart_rate"] >= 130
+            or result["spo2"] < 92
+            or result["temperature"] >= 38.5
+            or result["systolic_bp"] >= 150
+        ):
+            abnormal_count += 1
+
+    abnormal_rate = abnormal_count / total_events
+
+    assert 0.02 <= abnormal_rate <= 0.06

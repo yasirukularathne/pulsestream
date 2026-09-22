@@ -50,3 +50,34 @@ def test_abnormal_event_probability():
     abnormal_rate = abnormal_count / total_events
 
     assert 0.02 <= abnormal_rate <= 0.06
+
+
+def test_invalid_event_probability():
+    import random
+
+    invalid_count = 0
+    total_events = 1000
+
+    for seed in range(total_events):
+        result = generate_vitals(
+            "P0001",
+            80,
+            98,
+            random.Random(seed),
+        )
+
+        if (
+            result["heart_rate"] < 20
+            or result["heart_rate"] > 250
+            or result["spo2"] < 0
+            or result["spo2"] > 100
+            or result["systolic_bp"] < 20
+            or result["systolic_bp"] > 300
+            or result["temperature"] < 25
+            or result["temperature"] > 45
+        ):
+            invalid_count += 1
+
+    invalid_rate = invalid_count / total_events
+
+    assert 0.01 <= invalid_rate <= 0.025

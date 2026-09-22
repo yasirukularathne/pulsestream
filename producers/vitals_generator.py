@@ -2,8 +2,11 @@ import random
 
 from producers.abnormality import apply_abnormality
 from producers.event_metadata import create_event_metadata
+from producers.corruption import apply_invalid_value
+
 
 ABNORMAL_PROBABILITY = 0.04
+INVALID_PROBABILITY = 0.015
 
 
 def generate_vitals(
@@ -33,6 +36,9 @@ def generate_vitals(
 
     if rng.random() < ABNORMAL_PROBABILITY:
         vitals = apply_abnormality(vitals, rng)
+
+    if rng.random() < INVALID_PROBABILITY:
+        vitals = apply_invalid_value(vitals, rng)
 
     metadata = create_event_metadata(patient_id)
 

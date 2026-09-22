@@ -42,9 +42,9 @@ def generate_vitals(
         vitals = apply_invalid_value(vitals, rng)
 
     metadata = create_event_metadata(
-    patient_id,
-    event_ts=event_ts,
-)
+        patient_id,
+        event_ts=event_ts,
+    )
 
     vitals.update(metadata)
 

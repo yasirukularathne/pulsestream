@@ -146,3 +146,40 @@ def test_patient_events_can_contain_sensor_dropout():
     ]
 
     assert any(gap >= 20 for gap in gaps)
+
+
+def test_patient_events_can_contain_out_of_order_timestamp():
+    start_ts = datetime(
+        2026,
+        9,
+        22,
+        12,
+        0,
+        0,
+        tzinfo=timezone.utc,
+    )
+
+    events = generate_patient_events(
+        "P0001",
+        80,
+        98,
+        start_ts,
+        200,
+        random.Random(42),
+        out_of_order_probability=1.0,
+    )
+
+    timestamps = [
+        event["timestamp"]
+        for event in events
+    ]
+
+    has_out_of_order = any(
+        current < previous
+        for previous, current in zip(
+            timestamps,
+            timestamps[1:],
+        )
+    )
+
+    assert has_out_of_order

@@ -1,5 +1,5 @@
 kafka-python
-pyspark
+pyspark==4.2.0
 pandas
 psycopg2-binary
 fastapi

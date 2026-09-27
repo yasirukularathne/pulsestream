@@ -43,3 +43,6 @@ htmlcov/
 # Generated files
 *.tmp
 *.temp
+
+# Spark checkpoints
+spark/checkpoints/

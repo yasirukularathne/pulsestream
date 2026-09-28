@@ -20,33 +20,31 @@ POSTGRES_USER = "pulsestream"
 POSTGRES_PASSWORD = "changeme"
 
 
-def test_batch_pipeline():
-    print("PulseStream daily reconciliation pipeline started")
+REQUIRED_COLUMNS = {
+    "patient_id",
+    "test_type",
+    "result_value",
+    "reference_range",
+    "collected_at",
+}
+
+ALLOWED_TEST_TYPES = {
+    "CBC",
+    "Sodium",
+    "Potassium",
+    "Creatinine",
+}
 
 
-def validate_daily_labs(**context):
-    ds_nodash = context["ds_nodash"]
-    sim_date = context["ds"]
+def read_and_validate_daily_labs(file_path):
+    """
+    Read the daily lab CSV and separate valid rows from rejected rows.
 
-    file_path = LABS_DIR / f"labs_{ds_nodash}.csv"
-
-    print(f"Validating lab file: {file_path}")
-    print(f"Simulation date: {sim_date}")
-
-    required_columns = {
-        "patient_id",
-        "test_type",
-        "result_value",
-        "reference_range",
-        "collected_at",
-    }
-
-    allowed_test_types = {
-        "CBC",
-        "Sodium",
-        "Potassium",
-        "Creatinine",
-    }
+    Returns:
+        total_rows: total CSV data rows
+        valid_rows: rows suitable for daily_lab_results
+        rejected_rows: rows suitable for rejected_rows
+    """
 
     if not file_path.exists():
         raise FileNotFoundError(
@@ -54,14 +52,11 @@ def validate_daily_labs(**context):
         )
 
     total_rows = 0
-    valid_rows = 0
+    valid_rows = []
     rejected_rows = []
 
     seen_keys = set()
 
-    # ---------------------------------------------------------
-    # Read and validate CSV
-    # ---------------------------------------------------------
     with file_path.open(
         "r",
         newline="",
@@ -72,7 +67,7 @@ def validate_daily_labs(**context):
 
         actual_columns = set(reader.fieldnames or [])
 
-        missing_columns = required_columns - actual_columns
+        missing_columns = REQUIRED_COLUMNS - actual_columns
 
         if missing_columns:
             raise ValueError(
@@ -91,42 +86,24 @@ def validate_daily_labs(**context):
 
             reason = None
 
-            # -------------------------------------------------
-            # 1. Patient ID validation
-            # -------------------------------------------------
             if not patient_id:
                 reason = "missing_patient_id"
 
-            # -------------------------------------------------
-            # 2. Test type validation
-            # -------------------------------------------------
-            elif test_type not in allowed_test_types:
+            elif test_type not in ALLOWED_TEST_TYPES:
                 reason = "invalid_test_type"
 
-            # -------------------------------------------------
-            # 3. Result validation
-            # -------------------------------------------------
             else:
                 try:
                     float(result_value)
                 except ValueError:
                     reason = "invalid_result"
 
-            # -------------------------------------------------
-            # 4. Reference range validation
-            # -------------------------------------------------
             if reason is None and not reference_range:
                 reason = "missing_reference_range"
 
-            # -------------------------------------------------
-            # 5. Timestamp validation
-            # -------------------------------------------------
             if reason is None and not collected_at:
                 reason = "missing_collected_at"
 
-            # -------------------------------------------------
-            # 6. Duplicate patient + test validation
-            # -------------------------------------------------
             duplicate_key = (
                 patient_id,
                 test_type,
@@ -137,9 +114,6 @@ def validate_daily_labs(**context):
 
             seen_keys.add(duplicate_key)
 
-            # -------------------------------------------------
-            # Store rejected row
-            # -------------------------------------------------
             if reason is not None:
                 rejected_rows.append(
                     {
@@ -148,11 +122,44 @@ def validate_daily_labs(**context):
                     }
                 )
             else:
-                valid_rows += 1
+                valid_rows.append(
+                    {
+                        "patient_id": patient_id,
+                        "test_type": test_type,
+                        "result_value": result_value,
+                        "reference_range": reference_range,
+                        "collected_at": collected_at,
+                    }
+                )
 
-    # ---------------------------------------------------------
-    # Write rejected rows to PostgreSQL
-    # ---------------------------------------------------------
+    return total_rows, valid_rows, rejected_rows
+
+
+def get_simulation_context(context):
+    ds_nodash = context["ds_nodash"]
+    sim_date = context["ds"]
+
+    file_path = LABS_DIR / f"labs_{ds_nodash}.csv"
+
+    return sim_date, file_path
+
+
+def test_batch_pipeline():
+    print("PulseStream daily reconciliation pipeline started")
+
+
+def validate_daily_labs(**context):
+    sim_date, file_path = get_simulation_context(context)
+
+    print(f"Validating lab file: {file_path}")
+    print(f"Simulation date: {sim_date}")
+
+    (
+        total_rows,
+        valid_rows,
+        rejected_rows,
+    ) = read_and_validate_daily_labs(file_path)
+
     connection = None
 
     try:
@@ -166,10 +173,6 @@ def validate_daily_labs(**context):
 
         cursor = connection.cursor()
 
-        # -----------------------------------------------------
-        # Idempotency:
-        # Remove previous rejected rows for this simulation day
-        # -----------------------------------------------------
         cursor.execute(
             """
             DELETE FROM rejected_rows
@@ -190,9 +193,6 @@ def validate_daily_labs(**context):
                 f"for simulation date {sim_date}."
             )
 
-        # -----------------------------------------------------
-        # Insert current rejected rows
-        # -----------------------------------------------------
         for rejected in rejected_rows:
             cursor.execute(
                 """
@@ -235,14 +235,11 @@ def validate_daily_labs(**context):
         if connection:
             connection.close()
 
-    # ---------------------------------------------------------
-    # Validation summary
-    # ---------------------------------------------------------
     print("----- Daily Lab Validation Summary -----")
     print(f"File: {file_path}")
     print(f"Simulation date: {sim_date}")
     print(f"Total rows: {total_rows}")
-    print(f"Valid rows: {valid_rows}")
+    print(f"Valid rows: {len(valid_rows)}")
     print(f"Rejected rows: {len(rejected_rows)}")
 
     reason_counts = {}
@@ -267,9 +264,121 @@ def validate_daily_labs(**context):
     print("Lab validation completed successfully.")
 
 
-# =============================================================
-# Airflow DAG
-# =============================================================
+def stage_daily_labs(**context):
+    sim_date, file_path = get_simulation_context(context)
+
+    print(f"Staging valid lab rows from: {file_path}")
+    print(f"Simulation date: {sim_date}")
+
+    (
+        total_rows,
+        valid_rows,
+        rejected_rows,
+    ) = read_and_validate_daily_labs(file_path)
+
+    connection = None
+
+    try:
+        connection = psycopg2.connect(
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+            dbname=POSTGRES_DB,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+        )
+
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            DELETE FROM daily_lab_results
+            WHERE sim_date = %s
+            """,
+            (sim_date,),
+        )
+
+        deleted_rows = cursor.rowcount
+
+        if deleted_rows > 0:
+            print(
+                f"Deleted {deleted_rows} previous staged lab rows "
+                f"for simulation date {sim_date}."
+            )
+
+        staged_rows = 0
+
+        for row in valid_rows:
+            collected_at = datetime.fromisoformat(
+                row["collected_at"]
+            )
+
+            if collected_at.tzinfo is not None:
+                collected_at = (
+                    collected_at
+                    .astimezone(timezone.utc)
+                    .replace(tzinfo=None)
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO daily_lab_results (
+                    patient_id,
+                    test_type,
+                    result_value,
+                    reference_range,
+                    collected_at,
+                    sim_date
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    row["patient_id"],
+                    row["test_type"],
+                    row["result_value"],
+                    row["reference_range"],
+                    collected_at,
+                    sim_date,
+                ),
+            )
+
+            staged_rows += 1
+
+        connection.commit()
+
+        print(
+            f"Inserted {staged_rows} valid lab rows "
+            "into daily_lab_results."
+        )
+
+    except Exception as exc:
+        if connection:
+            connection.rollback()
+
+        print(
+            f"Failed to stage daily lab results: {exc}"
+        )
+
+        raise
+
+    finally:
+        if connection:
+            connection.close()
+
+    print("----- Daily Lab Staging Summary -----")
+    print(f"File: {file_path}")
+    print(f"Simulation date: {sim_date}")
+    print(f"Total rows: {total_rows}")
+    print(f"Valid rows staged: {len(valid_rows)}")
+    print(f"Rejected rows: {len(rejected_rows)}")
+    print("-------------------------------------")
+
+    if total_rows == 0:
+        raise ValueError(
+            "Lab file contains no data rows."
+        )
+
+    print("Daily lab staging completed successfully.")
+
 
 with DAG(
     dag_id="pulsestream_daily_reconciliation",
@@ -304,4 +413,14 @@ with DAG(
         python_callable=validate_daily_labs,
     )
 
-    start_pipeline >> wait_for_daily_labs >> validate_daily_labs
+    stage_daily_labs = PythonOperator(
+        task_id="stage_daily_labs",
+        python_callable=stage_daily_labs,
+    )
+
+    (
+        start_pipeline
+        >> wait_for_daily_labs
+        >> validate_daily_labs
+        >> stage_daily_labs
+    )

@@ -48,10 +48,10 @@ PulseStream follows a **Lambda Architecture** combining real-time stream process
 
 ### Architecture Layers
 
-* **Speed Layer** — Processes real-time patient vital-sign events using Apache Kafka and Spark Structured Streaming.
-* **Batch Layer** — Processes daily laboratory CSV data using Apache Airflow and performs reconciliation with real-time vital trends.
-* **Serving Layer** — Uses PostgreSQL as the central operational data store, with FastAPI providing REST APIs and Streamlit providing the dashboard.
-* **Observability Layer** — Monitors API and pipeline health using Prometheus and Grafana.
+- **Speed Layer** — Processes real-time patient vital-sign events using Apache Kafka and Spark Structured Streaming.
+- **Batch Layer** — Processes daily laboratory CSV data using Apache Airflow and performs reconciliation with real-time vital trends.
+- **Serving Layer** — Uses PostgreSQL as the central operational data store, with FastAPI providing REST APIs and Streamlit providing the dashboard.
+- **Observability Layer** — Monitors API and pipeline health using Prometheus and Grafana.
 
 > **Note:** Data is 100% synthetic. Operational risk flags (normal / watch / elevated) are monitoring indicators only and are not clinical decision support.
 

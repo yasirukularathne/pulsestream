@@ -48,6 +48,287 @@ ALLOWED_TEST_TYPES = {
 
 
 # =========================================================
+# DATABASE CONNECTION
+# =========================================================
+
+def get_postgres_connection():
+    return psycopg2.connect(
+        host=POSTGRES_HOST,
+        port=POSTGRES_PORT,
+        dbname=POSTGRES_DB,
+        user=POSTGRES_USER,
+        password=POSTGRES_PASSWORD,
+    )
+
+
+# =========================================================
+# PIPELINE RUN TRACKING
+# =========================================================
+
+def create_pipeline_run(**context):
+    """
+    Create a pipeline_runs record when the DAG starts.
+    """
+
+    dag_run = context["dag_run"]
+
+    dag_id = dag_run.dag_id
+    run_id = dag_run.run_id
+
+    started_at = datetime.now(timezone.utc).replace(
+        tzinfo=None
+    )
+
+    connection = None
+
+    try:
+        connection = get_postgres_connection()
+
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO pipeline_runs (
+                dag_id,
+                run_id,
+                status,
+                started_at,
+                ended_at,
+                records_processed,
+                records_rejected
+            )
+            VALUES (
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s
+            )
+            """,
+            (
+                dag_id,
+                run_id,
+                "running",
+                started_at,
+                None,
+                0,
+                0,
+            ),
+        )
+
+        connection.commit()
+
+        print(
+            "----- Pipeline Run Started -----"
+        )
+
+        print(
+            f"DAG ID: {dag_id}"
+        )
+
+        print(
+            f"Run ID: {run_id}"
+        )
+
+        print(
+            f"Started at: {started_at}"
+        )
+
+        print(
+            "Status: running"
+        )
+
+        print(
+            "---------------------------------"
+        )
+
+    except Exception as exc:
+
+        if connection:
+            connection.rollback()
+
+        print(
+            f"Failed to create pipeline run: {exc}"
+        )
+
+        raise
+
+    finally:
+
+        if connection:
+            connection.close()
+
+
+def update_pipeline_run(context, status):
+    """
+    Update pipeline_runs after the DAG finishes.
+
+    status:
+        success
+        failed
+    """
+
+    dag_run = context["dag_run"]
+
+    dag_id = dag_run.dag_id
+    run_id = dag_run.run_id
+
+    ended_at = datetime.now(timezone.utc).replace(
+        tzinfo=None
+    )
+
+    connection = None
+
+    try:
+
+        connection = get_postgres_connection()
+
+        cursor = connection.cursor()
+
+        # ---------------------------------------------------------
+        # Count successfully staged laboratory records
+        # ---------------------------------------------------------
+
+        sim_date = context["ds"]
+
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM daily_lab_results
+            WHERE sim_date = %s
+            """,
+            (sim_date,),
+        )
+
+        records_processed = cursor.fetchone()[0]
+
+        # ---------------------------------------------------------
+        # Count rejected laboratory records
+        # ---------------------------------------------------------
+
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM rejected_rows
+            WHERE source = %s
+              AND sim_date = %s
+            """,
+            (
+                "daily_labs",
+                sim_date,
+            ),
+        )
+
+        records_rejected = cursor.fetchone()[0]
+
+        # ---------------------------------------------------------
+        # Update pipeline run
+        # ---------------------------------------------------------
+
+        cursor.execute(
+            """
+            UPDATE pipeline_runs
+            SET
+                status = %s,
+                ended_at = %s,
+                records_processed = %s,
+                records_rejected = %s
+            WHERE dag_id = %s
+              AND run_id = %s
+            """,
+            (
+                status,
+                ended_at,
+                records_processed,
+                records_rejected,
+                dag_id,
+                run_id,
+            ),
+        )
+
+        connection.commit()
+
+        print(
+            "----- Pipeline Run Completed -----"
+        )
+
+        print(
+            f"DAG ID: {dag_id}"
+        )
+
+        print(
+            f"Run ID: {run_id}"
+        )
+
+        print(
+            f"Status: {status}"
+        )
+
+        print(
+            f"Ended at: {ended_at}"
+        )
+
+        print(
+            f"Records processed: "
+            f"{records_processed}"
+        )
+
+        print(
+            f"Records rejected: "
+            f"{records_rejected}"
+        )
+
+        print(
+            "-----------------------------------"
+        )
+
+    except Exception as exc:
+
+        if connection:
+            connection.rollback()
+
+        print(
+            f"Failed to update pipeline run: {exc}"
+        )
+
+        # Do not hide the original DAG result.
+        # The pipeline tracking failure is logged.
+        print(
+            "Pipeline execution status remains "
+            f"{status}."
+        )
+
+    finally:
+
+        if connection:
+            connection.close()
+
+
+def pipeline_success_callback(context):
+    """
+    DAG-level success callback.
+    """
+
+    update_pipeline_run(
+        context,
+        "success",
+    )
+
+
+def pipeline_failure_callback(context):
+    """
+    DAG-level failure callback.
+    """
+
+    update_pipeline_run(
+        context,
+        "failed",
+    )
+
+
+# =========================================================
 # SHARED LAB READER / VALIDATOR
 # =========================================================
 
@@ -95,6 +376,7 @@ def read_and_validate_daily_labs(file_path):
             reader,
             start=2,
         ):
+
             total_rows += 1
 
             patient_id = (
@@ -122,6 +404,7 @@ def read_and_validate_daily_labs(file_path):
             # -------------------------------------------------
 
             if not patient_id:
+
                 rejected_rows.append(
                     {
                         "row_number": row_number,
@@ -129,6 +412,7 @@ def read_and_validate_daily_labs(file_path):
                         "reason": "missing_patient_id",
                     }
                 )
+
                 continue
 
             # -------------------------------------------------
@@ -136,6 +420,7 @@ def read_and_validate_daily_labs(file_path):
             # -------------------------------------------------
 
             if test_type not in ALLOWED_TEST_TYPES:
+
                 rejected_rows.append(
                     {
                         "row_number": row_number,
@@ -143,6 +428,7 @@ def read_and_validate_daily_labs(file_path):
                         "reason": "invalid_test_type",
                     }
                 )
+
                 continue
 
             # -------------------------------------------------
@@ -150,8 +436,11 @@ def read_and_validate_daily_labs(file_path):
             # -------------------------------------------------
 
             try:
+
                 float(result_value)
+
             except (ValueError, TypeError):
+
                 rejected_rows.append(
                     {
                         "row_number": row_number,
@@ -159,6 +448,7 @@ def read_and_validate_daily_labs(file_path):
                         "reason": "invalid_result",
                     }
                 )
+
                 continue
 
             # -------------------------------------------------
@@ -166,6 +456,7 @@ def read_and_validate_daily_labs(file_path):
             # -------------------------------------------------
 
             if not reference_range:
+
                 rejected_rows.append(
                     {
                         "row_number": row_number,
@@ -173,9 +464,11 @@ def read_and_validate_daily_labs(file_path):
                         "reason": "missing_reference_range",
                     }
                 )
+
                 continue
 
             try:
+
                 lower, upper = (
                     reference_range.split("-", 1)
                 )
@@ -187,6 +480,7 @@ def read_and_validate_daily_labs(file_path):
                 ValueError,
                 AttributeError,
             ):
+
                 rejected_rows.append(
                     {
                         "row_number": row_number,
@@ -194,6 +488,7 @@ def read_and_validate_daily_labs(file_path):
                         "reason": "invalid_reference_range",
                     }
                 )
+
                 continue
 
             # -------------------------------------------------
@@ -201,11 +496,13 @@ def read_and_validate_daily_labs(file_path):
             # -------------------------------------------------
 
             try:
+
                 datetime.fromisoformat(
                     collected_at
                 )
 
             except ValueError:
+
                 rejected_rows.append(
                     {
                         "row_number": row_number,
@@ -213,6 +510,7 @@ def read_and_validate_daily_labs(file_path):
                         "reason": "invalid_collected_at",
                     }
                 )
+
                 continue
 
             # -------------------------------------------------
@@ -225,6 +523,7 @@ def read_and_validate_daily_labs(file_path):
             )
 
             if duplicate_key in seen_patient_tests:
+
                 rejected_rows.append(
                     {
                         "row_number": row_number,
@@ -232,6 +531,7 @@ def read_and_validate_daily_labs(file_path):
                         "reason": "duplicate_patient_test",
                     }
                 )
+
                 continue
 
             seen_patient_tests.add(
@@ -269,17 +569,6 @@ def get_simulation_context(context):
 
 
 # =========================================================
-# BASIC PIPELINE TEST
-# =========================================================
-
-def test_batch_pipeline():
-    print(
-        "PulseStream daily reconciliation "
-        "pipeline started"
-    )
-
-
-# =========================================================
 # VALIDATE DAILY LABS
 # =========================================================
 
@@ -302,6 +591,7 @@ def validate_daily_labs(**context):
     )
 
     if not file_path.exists():
+
         raise FileNotFoundError(
             f"Lab file not found: {file_path}"
         )
@@ -317,13 +607,8 @@ def validate_daily_labs(**context):
     connection = None
 
     try:
-        connection = psycopg2.connect(
-            host=POSTGRES_HOST,
-            port=POSTGRES_PORT,
-            dbname=POSTGRES_DB,
-            user=POSTGRES_USER,
-            password=POSTGRES_PASSWORD,
-        )
+
+        connection = get_postgres_connection()
 
         cursor = connection.cursor()
 
@@ -380,23 +665,30 @@ def validate_daily_labs(**context):
         print(
             "----- Daily Lab Validation -----"
         )
+
         print(
             f"Simulation date: {sim_date}"
         )
+
         print(
             f"Total rows: {total_rows}"
         )
+
         print(
             f"Valid rows: {len(valid_rows)}"
         )
+
         print(
-            f"Rejected rows: {len(rejected_rows)}"
+            f"Rejected rows: "
+            f"{len(rejected_rows)}"
         )
+
         print(
             "---------------------------------"
         )
 
         if total_rows == 0:
+
             raise ValueError(
                 f"No laboratory rows found "
                 f"for {sim_date}."
@@ -443,6 +735,7 @@ def stage_daily_labs(**context):
     )
 
     if not file_path.exists():
+
         raise FileNotFoundError(
             f"Lab file not found: {file_path}"
         )
@@ -456,6 +749,7 @@ def stage_daily_labs(**context):
     )
 
     if not valid_rows:
+
         raise ValueError(
             f"No valid laboratory rows "
             f"available for {sim_date}."
@@ -465,13 +759,7 @@ def stage_daily_labs(**context):
 
     try:
 
-        connection = psycopg2.connect(
-            host=POSTGRES_HOST,
-            port=POSTGRES_PORT,
-            dbname=POSTGRES_DB,
-            user=POSTGRES_USER,
-            password=POSTGRES_PASSWORD,
-        )
+        connection = get_postgres_connection()
 
         cursor = connection.cursor()
 
@@ -496,10 +784,6 @@ def stage_daily_labs(**context):
             collected_at = datetime.fromisoformat(
                 row["collected_at"]
             )
-
-            # Convert timezone-aware timestamp to UTC
-            # and store it as a naive timestamp because
-            # the PostgreSQL schema uses TIMESTAMP.
 
             if collected_at.tzinfo is not None:
 
@@ -543,23 +827,29 @@ def stage_daily_labs(**context):
         print(
             "----- Daily Lab Staging -----"
         )
+
         print(
             f"Simulation date: {sim_date}"
         )
+
         print(
             f"Input rows: {total_rows}"
         )
+
         print(
             f"Valid rows staged: "
             f"{len(valid_rows)}"
         )
+
         print(
             f"Rejected rows: "
             f"{len(rejected_rows)}"
         )
+
         print(
             "Daily lab staging completed."
         )
+
         print(
             "------------------------------"
         )
@@ -591,9 +881,6 @@ def calculate_daily_risk(**context):
     Calculate the authoritative operational risk flag
     by reconciling the latest realtime trend evidence
     with the daily laboratory results.
-
-    This task only calculates and prints the report.
-    It does not write to daily_risk_report yet.
     """
 
     sim_date, _ = get_simulation_context(context)
@@ -606,18 +893,13 @@ def calculate_daily_risk(**context):
     connection = None
 
     try:
-        connection = psycopg2.connect(
-            host=POSTGRES_HOST,
-            port=POSTGRES_PORT,
-            dbname=POSTGRES_DB,
-            user=POSTGRES_USER,
-            password=POSTGRES_PASSWORD,
-        )
+
+        connection = get_postgres_connection()
 
         cursor = connection.cursor()
 
         # ---------------------------------------------------------
-        # 1. Get patients represented in today's valid lab data
+        # Get patients represented in today's valid lab data
         # ---------------------------------------------------------
 
         cursor.execute(
@@ -636,20 +918,22 @@ def calculate_daily_risk(**context):
         ]
 
         if not patients:
+
             raise ValueError(
-                f"No staged lab patients found for {sim_date}."
+                f"No staged lab patients found "
+                f"for {sim_date}."
             )
 
         reports = []
 
         # ---------------------------------------------------------
-        # 2. Calculate daily evidence for each patient
+        # Calculate daily evidence for each patient
         # ---------------------------------------------------------
 
         for patient_id in patients:
 
             # -----------------------------------------------------
-            # Latest realtime trend on or before simulation date
+            # Latest realtime trend
             # -----------------------------------------------------
 
             cursor.execute(
@@ -708,7 +992,7 @@ def calculate_daily_risk(**context):
                 trend_available = True
 
             # -----------------------------------------------------
-            # Evaluate today's laboratory results
+            # Evaluate laboratory results
             # -----------------------------------------------------
 
             cursor.execute(
@@ -752,12 +1036,14 @@ def calculate_daily_risk(**context):
                         value < lower
                         or value > upper
                     ):
+
                         abnormal_labs += 1
 
                 except (
                     ValueError,
                     AttributeError,
                 ):
+
                     continue
 
             lab_count = len(lab_rows)
@@ -855,7 +1141,7 @@ def calculate_daily_risk(**context):
             )
 
         # ---------------------------------------------------------
-        # 3. Print calculation results
+        # Print calculation results
         # ---------------------------------------------------------
 
         print(
@@ -867,7 +1153,8 @@ def calculate_daily_risk(**context):
         )
 
         print(
-            f"Patients evaluated: {len(reports)}"
+            f"Patients evaluated: "
+            f"{len(reports)}"
         )
 
         for report in reports:
@@ -909,17 +1196,10 @@ def write_daily_risk_report(**context):
     Persist the authoritative daily risk report
     into PostgreSQL.
 
-    The write is idempotent for each simulation date.
-
-    Existing rows for the simulation date are deleted
-    before inserting the newly calculated report.
+    Idempotent for each simulation date.
     """
 
     sim_date, _ = get_simulation_context(context)
-
-    # ---------------------------------------------------------
-    # Read calculated reports from XCom
-    # ---------------------------------------------------------
 
     reports = context["ti"].xcom_pull(
         task_ids="calculate_daily_risk"
@@ -936,18 +1216,12 @@ def write_daily_risk_report(**context):
 
     try:
 
-        connection = psycopg2.connect(
-            host=POSTGRES_HOST,
-            port=POSTGRES_PORT,
-            dbname=POSTGRES_DB,
-            user=POSTGRES_USER,
-            password=POSTGRES_PASSWORD,
-        )
+        connection = get_postgres_connection()
 
         cursor = connection.cursor()
 
         # ---------------------------------------------------------
-        # 1. Delete existing report for this simulation date
+        # Delete existing reports for simulation date
         # ---------------------------------------------------------
 
         cursor.execute(
@@ -961,7 +1235,7 @@ def write_daily_risk_report(**context):
         deleted_rows = cursor.rowcount
 
         # ---------------------------------------------------------
-        # 2. Insert newly calculated reports
+        # Insert new reports
         # ---------------------------------------------------------
 
         insert_sql = """
@@ -1048,8 +1322,7 @@ def write_daily_risk_report(**context):
 
 def quality_gate(**context):
     """
-    Validate the persisted daily risk report before
-    considering the batch pipeline successful.
+    Validate the persisted daily risk report.
     """
 
     sim_date, _ = get_simulation_context(context)
@@ -1060,18 +1333,12 @@ def quality_gate(**context):
 
     try:
 
-        connection = psycopg2.connect(
-            host=POSTGRES_HOST,
-            port=POSTGRES_PORT,
-            dbname=POSTGRES_DB,
-            user=POSTGRES_USER,
-            password=POSTGRES_PASSWORD,
-        )
+        connection = get_postgres_connection()
 
         cursor = connection.cursor()
 
         # ---------------------------------------------------------
-        # 1. Verify expected daily risk report count
+        # Expected report count
         # ---------------------------------------------------------
 
         cursor.execute(
@@ -1094,7 +1361,7 @@ def quality_gate(**context):
             )
 
         # ---------------------------------------------------------
-        # 2. Verify allowed operational risk flags
+        # Valid risk flags
         # ---------------------------------------------------------
 
         cursor.execute(
@@ -1122,7 +1389,7 @@ def quality_gate(**context):
             )
 
         # ---------------------------------------------------------
-        # 3. Verify required fields are not NULL
+        # Required fields
         # ---------------------------------------------------------
 
         cursor.execute(
@@ -1152,7 +1419,7 @@ def quality_gate(**context):
             )
 
         # ---------------------------------------------------------
-        # 4. Verify staged laboratory data exists
+        # Staged laboratory data
         # ---------------------------------------------------------
 
         cursor.execute(
@@ -1174,7 +1441,7 @@ def quality_gate(**context):
             )
 
         # ---------------------------------------------------------
-        # 5. Quality gate passed
+        # Quality gate passed
         # ---------------------------------------------------------
 
         print(
@@ -1234,28 +1501,41 @@ def quality_gate(**context):
 
 with DAG(
     dag_id="pulsestream_daily_reconciliation",
+
     start_date=datetime(
         2026,
         9,
         28,
         tzinfo=timezone.utc,
     ),
+
     schedule="@daily",
+
     catchup=False,
+
     tags=[
         "pulsestream",
         "batch",
         "reconciliation",
     ],
+
+    # ---------------------------------------------------------
+    # DAG-level callbacks
+    # ---------------------------------------------------------
+
+    on_success_callback=pipeline_success_callback,
+
+    on_failure_callback=pipeline_failure_callback,
+
 ) as dag:
 
     # ---------------------------------------------------------
-    # Pipeline start
+    # Start pipeline
     # ---------------------------------------------------------
 
     start_pipeline = PythonOperator(
         task_id="start_pipeline",
-        python_callable=test_batch_pipeline,
+        python_callable=create_pipeline_run,
     )
 
     # ---------------------------------------------------------
@@ -1264,14 +1544,19 @@ with DAG(
 
     wait_for_daily_labs = FileSensor(
         task_id="wait_for_daily_labs",
+
         filepath=(
             "mnt/c/Users/yasiru/Desktop/"
             "pulsestream/data/incoming/"
             "labs_{{ ds_nodash }}.csv"
         ),
+
         fs_conn_id="fs_default",
+
         poke_interval=10,
+
         timeout=300,
+
         mode="poke",
     )
 

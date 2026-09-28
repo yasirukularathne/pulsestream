@@ -34,6 +34,11 @@ active_patients_metric = Gauge(
     "Number of active patients",
 )
 
+watch_or_elevated_patients_metric = Gauge(
+    "pulsestream_watch_or_elevated_patients",
+    "Number of patients currently flagged watch or elevated",
+)
+
 
 # ---------------------------------------------------------
 # Prometheus Metrics Endpoint
@@ -41,6 +46,68 @@ active_patients_metric = Gauge(
 
 @app.get("/metrics")
 def metrics():
+    """
+    Expose Prometheus metrics.
+
+    KPI gauges are refreshed directly from PostgreSQL so that
+    Prometheus and Grafana always receive the current
+    operational state from the source of truth.
+    """
+
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cursor:
+
+            # -------------------------------------------------
+            # Active patients
+            # -------------------------------------------------
+
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM patients;
+                """
+            )
+
+            active_patients = cursor.fetchone()[0]
+
+            # -------------------------------------------------
+            # Latest realtime risk per patient
+            # -------------------------------------------------
+
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM (
+                    SELECT DISTINCT ON (patient_id)
+                        patient_id,
+                        risk_flag_realtime
+                    FROM vitals_trends
+                    ORDER BY patient_id, window_end DESC
+                ) latest
+                WHERE risk_flag_realtime IN (
+                    'watch',
+                    'elevated'
+                );
+                """
+            )
+
+            watch_or_elevated_patients = cursor.fetchone()[0]
+
+        # -----------------------------------------------------
+        # Update Prometheus gauges
+        # -----------------------------------------------------
+
+        active_patients_metric.set(active_patients)
+
+        watch_or_elevated_patients_metric.set(
+            watch_or_elevated_patients
+        )
+
+    finally:
+        conn.close()
+
     return Response(
         content=generate_latest(),
         media_type=CONTENT_TYPE_LATEST,
@@ -193,7 +260,10 @@ def get_patient_risk(patient_id: str):
     try:
         with conn.cursor() as cursor:
 
+            # -------------------------------------------------
             # Latest realtime risk
+            # -------------------------------------------------
+
             cursor.execute(
                 """
                 SELECT
@@ -211,7 +281,10 @@ def get_patient_risk(patient_id: str):
 
             realtime_row = cursor.fetchone()
 
+            # -------------------------------------------------
             # Latest daily risk
+            # -------------------------------------------------
+
             cursor.execute(
                 """
                 SELECT
@@ -323,7 +396,10 @@ def get_kpis():
     try:
         with conn.cursor() as cursor:
 
+            # -------------------------------------------------
             # Active patients
+            # -------------------------------------------------
+
             cursor.execute(
                 """
                 SELECT COUNT(*)
@@ -336,7 +412,10 @@ def get_kpis():
             # Update Prometheus gauge
             active_patients_metric.set(active_patients)
 
+            # -------------------------------------------------
             # Latest realtime risk per patient
+            # -------------------------------------------------
+
             cursor.execute(
                 """
                 SELECT COUNT(*)
@@ -356,7 +435,15 @@ def get_kpis():
 
             watch_or_elevated_patients = cursor.fetchone()[0]
 
+            # Update Prometheus gauge
+            watch_or_elevated_patients_metric.set(
+                watch_or_elevated_patients
+            )
+
+            # -------------------------------------------------
             # Active alerts
+            # -------------------------------------------------
+
             cursor.execute(
                 """
                 SELECT COUNT(*)
@@ -366,6 +453,10 @@ def get_kpis():
             )
 
             active_alerts = cursor.fetchone()[0]
+
+        # -----------------------------------------------------
+        # Risk percentage
+        # -----------------------------------------------------
 
         risk_percentage = (
             round(

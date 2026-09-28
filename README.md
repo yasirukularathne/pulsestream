@@ -990,10 +990,6 @@ Potential extensions include:
 
 ---
 
-# Academic Context
-
-**Module:** EC8203 — Applied Big Data Engineering
-
 **Project:** PulseStream — Real-Time Hospital Patient Monitoring & Data Reconciliation Platform
 
 **Architecture:** Lambda Architecture
@@ -1094,7 +1090,3 @@ The project focuses on practical data-engineering concepts including **real-time
 > **PulseStream is an academic prototype built entirely with synthetic data and is not intended for clinical or medical use.**
 
 ---
-
-### EC8203 — Applied Big Data Engineering
-
-**PulseStream — Real-Time Hospital Patient Monitoring & Data Reconciliation Platform**

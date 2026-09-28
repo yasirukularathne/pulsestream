@@ -644,6 +644,12 @@ def write_to_postgres(
                     %s,
                     %s
                 )
+                ON CONFLICT (
+                    patient_id,
+                    window_start,
+                    window_end
+                )
+                DO NOTHING
                 """,
                 (
                     patient_id,
@@ -673,11 +679,9 @@ def write_to_postgres(
                         rule_triggered,
                         severity,
                         triggered_at,
-                        resolved_at,
                         source_layer
                     )
                     VALUES (
-                        %s,
                         %s,
                         %s,
                         %s,
@@ -687,14 +691,9 @@ def write_to_postgres(
                     """,
                     (
                         patient_id,
-                        (
-                            f"{abnormal_count} abnormal "
-                            "vital events in "
-                            "90-second window"
-                        ),
+                        f"{abnormal_count} abnormal vital events in 90-second window",
                         risk_flag,
                         window_end,
-                        None,
                         "speed",
                     ),
                 )
@@ -702,18 +701,18 @@ def write_to_postgres(
         connection.commit()
 
         print(
-            f"PostgreSQL batch {batch_id}: "
-            f"inserted {len(rows)} trend rows"
+            f"Batch {batch_id}: "
+            f"persisted {len(rows)} realtime trend rows"
         )
 
-    except Exception as exc:
+    except Exception as error:
 
         if connection:
             connection.rollback()
 
         print(
-            f"PostgreSQL batch {batch_id} failed: "
-            f"{exc}"
+            f"Batch {batch_id}: "
+            f"PostgreSQL write failed: {error}"
         )
 
         raise

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from producers.event_sequence import generate_patient_events
 from producers.kafka_producer import create_producer
 from producers.patient_generator import generate_patients
+from producers.patient_registry import register_patients
 
 
 PATIENT_COUNT = 20
@@ -18,6 +19,9 @@ def main():
         count=PATIENT_COUNT,
         seed=SEED,
     )
+
+    # Register the same synthetic patients in PostgreSQL
+    register_patients(patients)
 
     producer = create_producer()
 

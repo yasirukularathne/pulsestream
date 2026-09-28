@@ -1,5 +1,4 @@
 services:
-
   kafka:
     image: apache/kafka:4.0.1
     container_name: pulsestream-kafka
@@ -24,7 +23,7 @@ services:
     image: postgres:16
     container_name: pulsestream-postgres
     ports:
-      - "5432:5432"
+      - "5433:5432"
     environment:
       POSTGRES_USER: pulsestream
       POSTGRES_PASSWORD: changeme

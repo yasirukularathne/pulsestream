@@ -45,4 +45,6 @@ htmlcov/
 *.temp
 
 # Spark checkpoints
+spark/checkpoints/.venv-airflow/
 spark/checkpoints/
+/.venv-airflow/

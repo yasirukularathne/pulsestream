@@ -1,178 +1,570 @@
+import os
+
+import psycopg2
+from dotenv import load_dotenv
+
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, lit, when
+from pyspark.sql.functions import (
+    avg,
+    col,
+    count,
+    from_json,
+    lit,
+    max as spark_max,
+    min as spark_min,
+    struct,
+    sum as spark_sum,
+    to_json,
+    when,
+    window,
+)
 from pyspark.sql.types import (
     DoubleType,
     IntegerType,
     StringType,
     StructField,
     StructType,
-    TimestampType,
 )
 
 
-KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
-KAFKA_TOPIC = "vitals.events"
-KAFKA_DLQ_TOPIC = "vitals.dead-letter"
+load_dotenv()
 
 
-EVENT_SCHEMA = StructType([
-    StructField("patient_id", StringType(), False),
-    StructField("heart_rate", IntegerType(), True),
-    StructField("spo2", DoubleType(), True),
-    StructField("systolic_bp", IntegerType(), True),
-    StructField("diastolic_bp", IntegerType(), True),
-    StructField("temperature", DoubleType(), True),
-    StructField("event_id", StringType(), False),
-    StructField("timestamp", TimestampType(), True),
-])
+# ============================================================
+# Configuration
+# ============================================================
 
+KAFKA_BOOTSTRAP_SERVERS = os.getenv(
+    "KAFKA_BOOTSTRAP_SERVERS",
+    "localhost:9092",
+)
 
-def create_spark_session():
-    return (
-        SparkSession.builder
-        .appName("PulseStreamKafkaReader")
-        .master("local[2]")
-        .getOrCreate()
+KAFKA_TOPIC_VITALS = os.getenv(
+    "KAFKA_TOPIC_VITALS",
+    "vitals.events",
+)
+
+KAFKA_TOPIC_DLQ = os.getenv(
+    "KAFKA_TOPIC_DLQ",
+    "vitals.dead-letter",
+)
+
+POSTGRES_HOST = os.getenv(
+    "POSTGRES_HOST",
+    "localhost",
+)
+
+POSTGRES_PORT = int(
+    os.getenv(
+        "POSTGRES_PORT",
+        "5433",
     )
+)
+
+POSTGRES_DB = os.getenv(
+    "POSTGRES_DB",
+    "pulsestream",
+)
+
+POSTGRES_USER = os.getenv(
+    "POSTGRES_USER",
+    "pulsestream",
+)
+
+POSTGRES_PASSWORD = os.getenv(
+    "POSTGRES_PASSWORD",
+    "changeme",
+)
 
 
-def main():
-    spark = create_spark_session()
-    spark.sparkContext.setLogLevel("WARN")
+# ============================================================
+# Spark Session
+# ============================================================
+
+spark = (
+    SparkSession.builder
+    .appName("PulseStreamVitals")
+    .master("local[2]")
+    .config("spark.sql.shuffle.partitions", "4")
+    .getOrCreate()
+)
+
+spark.sparkContext.setLogLevel("WARN")
+
+
+# ============================================================
+# Event Schema
+# ============================================================
+
+event_schema = StructType(
+    [
+        StructField("patient_id", StringType(), False),
+        StructField("heart_rate", IntegerType(), True),
+        StructField("spo2", DoubleType(), True),
+        StructField("systolic_bp", IntegerType(), True),
+        StructField("diastolic_bp", IntegerType(), True),
+        StructField("temperature", DoubleType(), True),
+        StructField("event_id", StringType(), False),
+        StructField("timestamp", StringType(), False),
+    ]
+)
+
+
+# ============================================================
+# Read from Kafka
+# ============================================================
+
+raw_stream = (
+    spark.readStream
+    .format("kafka")
+    .option(
+        "kafka.bootstrap.servers",
+        KAFKA_BOOTSTRAP_SERVERS,
+    )
+    .option(
+        "subscribe",
+        KAFKA_TOPIC_VITALS,
+    )
+    .option(
+        "startingOffsets",
+        "latest",
+    )
+    .option(
+        "failOnDataLoss",
+        "false",
+    )
+    .load()
+)
+
+
+# ============================================================
+# Parse Kafka JSON
+# ============================================================
+
+parsed_stream = (
+    raw_stream
+    .selectExpr(
+        "CAST(key AS STRING) AS kafka_key",
+        "CAST(value AS STRING) AS json_value",
+    )
+    .select(
+        from_json(
+            col("json_value"),
+            event_schema,
+        ).alias("data")
+    )
+    .select("data.*")
+)
+
+
+# ============================================================
+# Data Validation
+# ============================================================
+
+validated_stream = (
+    parsed_stream
+    .withColumn(
+        "validation_status",
+        when(
+            col("patient_id").isNull()
+            | col("event_id").isNull()
+            | col("timestamp").isNull()
+            | col("heart_rate").isNull()
+            | col("spo2").isNull()
+            | col("systolic_bp").isNull()
+            | col("diastolic_bp").isNull()
+            | col("temperature").isNull(),
+            lit("invalid"),
+        )
+        .when(
+            (col("heart_rate") < 60)
+            | (col("heart_rate") > 180),
+            lit("invalid"),
+        )
+        .when(
+            (col("spo2") < 70)
+            | (col("spo2") > 100),
+            lit("invalid"),
+        )
+        .when(
+            (col("systolic_bp") < 70)
+            | (col("systolic_bp") > 250),
+            lit("invalid"),
+        )
+        .when(
+            (col("diastolic_bp") < 40)
+            | (col("diastolic_bp") > 150),
+            lit("invalid"),
+        )
+        .when(
+            (col("temperature") < 30)
+            | (col("temperature") > 45),
+            lit("invalid"),
+        )
+        .otherwise(
+            lit("valid")
+        ),
+    )
+)
+
+
+# ============================================================
+# Invalid Events → Dead Letter Queue
+# ============================================================
+
+invalid_stream = (
+    validated_stream
+    .filter(
+        col("validation_status") == "invalid"
+    )
+    .select(
+        to_json(
+            struct(
+                "patient_id",
+                "heart_rate",
+                "spo2",
+                "systolic_bp",
+                "diastolic_bp",
+                "temperature",
+                "event_id",
+                "timestamp",
+            )
+        ).alias("value")
+    )
+)
+
+
+dlq_query = (
+    invalid_stream
+    .writeStream
+    .format("kafka")
+    .option(
+        "kafka.bootstrap.servers",
+        KAFKA_BOOTSTRAP_SERVERS,
+    )
+    .option(
+        "topic",
+        KAFKA_TOPIC_DLQ,
+    )
+    .option(
+        "checkpointLocation",
+        "spark/checkpoints/dlq-test",
+    )
+    .outputMode("append")
+    .start()
+)
+
+
+# ============================================================
+# Valid Events
+# ============================================================
+
+valid_stream = (
+    validated_stream
+    .filter(
+        col("validation_status") == "valid"
+    )
+    .drop("validation_status")
+)
+
+
+# ============================================================
+# Event Timestamp
+# ============================================================
+
+timestamped_stream = (
+    valid_stream
+    .withColumn(
+        "event_timestamp",
+        col("timestamp").cast("timestamp"),
+    )
+)
+
+
+# ============================================================
+# Watermark + Deduplication
+# ============================================================
+
+deduplicated_stream = (
+    timestamped_stream
+    .withWatermark(
+        "event_timestamp",
+        "30 seconds",
+    )
+    .dropDuplicates(
+        ["event_id"]
+    )
+)
+
+
+# ============================================================
+# Abnormality Detection
+# ============================================================
+
+classified_stream = (
+    deduplicated_stream
+    .withColumn(
+        "is_abnormal",
+        when(
+            (col("heart_rate") < 60)
+            | (col("heart_rate") > 180)
+            | (col("spo2") < 90)
+            | (col("systolic_bp") < 90)
+            | (col("systolic_bp") > 180)
+            | (col("diastolic_bp") < 60)
+            | (col("diastolic_bp") > 120)
+            | (col("temperature") < 36)
+            | (col("temperature") > 38),
+            1,
+        )
+        .otherwise(0),
+    )
+)
+
+
+# ============================================================
+# 90-Second Tumbling Window
+# ============================================================
+
+windowed_stream = (
+    classified_stream
+    .groupBy(
+        col("patient_id"),
+        window(
+            col("event_timestamp"),
+            "90 seconds",
+        ),
+    )
+    .agg(
+        avg("heart_rate").alias(
+            "avg_heart_rate"
+        ),
+        spark_min("heart_rate").alias(
+            "min_hr"
+        ),
+        spark_max("heart_rate").alias(
+            "max_hr"
+        ),
+        avg("spo2").alias(
+            "avg_spo2"
+        ),
+        spark_min("spo2").alias(
+            "min_spo2"
+        ),
+        spark_max("spo2").alias(
+            "max_spo2"
+        ),
+        avg("systolic_bp").alias(
+            "avg_systolic_bp"
+        ),
+        avg("diastolic_bp").alias(
+            "avg_diastolic_bp"
+        ),
+        avg("temperature").alias(
+            "avg_temperature"
+        ),
+        count("*").alias(
+            "event_count"
+        ),
+        spark_sum("is_abnormal").alias(
+            "abnormal_count"
+        ),
+    )
+)
+
+
+# ============================================================
+# Risk Flag
+# ============================================================
+
+risk_stream = (
+    windowed_stream
+    .withColumn(
+        "risk_flag",
+        when(
+            col("abnormal_count") >= 2,
+            lit("elevated"),
+        )
+        .when(
+            col("abnormal_count") == 1,
+            lit("watch"),
+        )
+        .otherwise(
+            lit("normal")
+        ),
+    )
+)
+
+
+# ============================================================
+# PostgreSQL Sink
+# ============================================================
+
+def write_to_postgres(
+    batch_df,
+    batch_id,
+):
+    rows = batch_df.collect()
+
+    if not rows:
+        return
+
+    connection = None
 
     try:
-        # ---------------------------------------------------------
-        # 1. Read events from Kafka
-        # ---------------------------------------------------------
-        stream_df = (
-            spark.readStream
-            .format("kafka")
-            .option(
-                "kafka.bootstrap.servers",
-                KAFKA_BOOTSTRAP_SERVERS,
-            )
-            .option("subscribe", KAFKA_TOPIC)
-            .option("startingOffsets", "earliest")
-            .load()
+        connection = psycopg2.connect(
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+            dbname=POSTGRES_DB,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
         )
 
-        # ---------------------------------------------------------
-        # 2. Extract Kafka key, original JSON and Kafka timestamp
-        # ---------------------------------------------------------
-        raw_df = stream_df.selectExpr(
-            "CAST(key AS STRING) AS patient_id",
-            "CAST(value AS STRING) AS event_json",
-            "timestamp AS kafka_timestamp",
-        )
+        cursor = connection.cursor()
 
-        # ---------------------------------------------------------
-        # 3. Parse JSON according to event schema
-        # ---------------------------------------------------------
-        parsed_df = (
-            raw_df
-            .withColumn(
-                "event",
-                from_json(col("event_json"), EVENT_SCHEMA),
-            )
-            .select(
-                "event.*",
-                "event_json",
-                "kafka_timestamp",
-            )
-        )
+        for row in rows:
 
-        # ---------------------------------------------------------
-        # 4. Validate vital-sign data
-        #
-        # These are DATA-QUALITY validation ranges,
-        # not clinical decision thresholds.
-        # ---------------------------------------------------------
-        validated_df = (
-            parsed_df
-            .withColumn(
-                "validation_status",
-                when(
-                    (col("heart_rate") < 60) |
-                    (col("heart_rate") > 180) |
-                    (col("spo2") < 70) |
-                    (col("spo2") > 100) |
-                    (col("systolic_bp") < 70) |
-                    (col("systolic_bp") > 250) |
-                    (col("diastolic_bp") < 40) |
-                    (col("diastolic_bp") > 150) |
-                    (col("temperature") < 30) |
-                    (col("temperature") > 45),
-                    lit("invalid"),
+            patient_id = row["patient_id"]
+            window_start = row["window"]["start"]
+            window_end = row["window"]["end"]
+
+            avg_hr = row["avg_heart_rate"]
+            avg_spo2 = row["avg_spo2"]
+            avg_temp = row["avg_temperature"]
+
+            abnormal_count = row["abnormal_count"]
+            risk_flag = row["risk_flag"]
+
+            # ------------------------------------------------
+            # Insert realtime trend
+            # ------------------------------------------------
+
+            cursor.execute(
+                """
+                INSERT INTO vitals_trends (
+                    patient_id,
+                    window_start,
+                    window_end,
+                    avg_hr,
+                    avg_spo2,
+                    avg_temp,
+                    abnormal_count,
+                    risk_flag_realtime
                 )
-                .otherwise(lit("valid")),
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                )
+                """,
+                (
+                    patient_id,
+                    window_start,
+                    window_end,
+                    avg_hr,
+                    avg_spo2,
+                    avg_temp,
+                    abnormal_count,
+                    risk_flag,
+                ),
             )
+
+            # ------------------------------------------------
+            # Create alert for watch/elevated
+            # ------------------------------------------------
+
+            if risk_flag in (
+                "watch",
+                "elevated",
+            ):
+
+                cursor.execute(
+                    """
+                    INSERT INTO alerts (
+                        patient_id,
+                        rule_triggered,
+                        severity,
+                        triggered_at,
+                        resolved_at,
+                        source_layer
+                    )
+                    VALUES (
+                        %s,
+                        %s,
+                        %s,
+                        %s,
+                        %s,
+                        %s
+                    )
+                    """,
+                    (
+                        patient_id,
+                        (
+                            f"{abnormal_count} abnormal "
+                            "vital events in "
+                            "90-second window"
+                        ),
+                        risk_flag,
+                        window_end,
+                        None,
+                        "speed",
+                    ),
+                )
+
+        connection.commit()
+
+        print(
+            f"PostgreSQL batch {batch_id}: "
+            f"inserted {len(rows)} trend rows"
         )
 
-        # ---------------------------------------------------------
-        # 5. Select invalid events for Dead Letter Queue
-        # ---------------------------------------------------------
-        invalid_df = (
-            validated_df
-            .filter(col("validation_status") == "invalid")
-            .select(
-                col("patient_id").alias("key"),
-                col("event_json").alias("value"),
-            )
+    except Exception as exc:
+
+        if connection:
+            connection.rollback()
+
+        print(
+            f"PostgreSQL batch {batch_id} failed: "
+            f"{exc}"
         )
 
-        # ---------------------------------------------------------
-        # 6. Write invalid events to Kafka DLQ
-        # ---------------------------------------------------------
-        dlq_query = (
-            invalid_df
-            .selectExpr(
-                "CAST(key AS STRING) AS key",
-                "CAST(value AS STRING) AS value",
-            )
-            .writeStream
-            .format("kafka")
-            .option(
-                "kafka.bootstrap.servers",
-                KAFKA_BOOTSTRAP_SERVERS,
-            )
-            .option(
-                "topic",
-                KAFKA_DLQ_TOPIC,
-            )
-            .option(
-                "checkpointLocation",
-                "spark/checkpoints/dlq",
-            )
-            .outputMode("append")
-            .start()
-        )
-
-        # ---------------------------------------------------------
-        # 7. Temporary console output for validation testing
-        #
-        # This only shows TEST_INVALID so we can verify
-        # the invalid classification.
-        # ---------------------------------------------------------
-        query = (
-            validated_df
-            .filter(
-                col("patient_id") == "TEST_INVALID"
-            )
-            .writeStream
-            .format("console")
-            .outputMode("append")
-            .option("truncate", "false")
-            .option("numRows", 10)
-            .trigger(processingTime="5 seconds")
-            .start()
-        )
-
-        # Keep Spark streaming alive
-        dlq_query.awaitTermination()
+        raise
 
     finally:
-        spark.stop()
+
+        if connection:
+            connection.close()
 
 
-if __name__ == "__main__":
-    main()
+# ============================================================
+# Write Realtime Aggregations to PostgreSQL
+# ============================================================
+
+postgres_query = (
+    risk_stream
+    .writeStream
+    .outputMode("append")
+    .foreachBatch(
+        write_to_postgres
+    )
+    .option(
+        "checkpointLocation",
+        "spark/checkpoints/postgres-test",
+    )
+    .trigger(
+        processingTime="5 seconds"
+    )
+    .start()
+)
+
+
+# ============================================================
+# Wait for Streaming Queries
+# ============================================================
+
+postgres_query.awaitTermination()

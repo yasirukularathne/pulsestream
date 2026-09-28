@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timezone
 
 import psycopg2
 from dotenv import load_dotenv
@@ -85,7 +86,10 @@ spark = (
     SparkSession.builder
     .appName("PulseStreamVitals")
     .master("local[2]")
-    .config("spark.sql.shuffle.partitions", "4")
+    .config(
+        "spark.sql.shuffle.partitions",
+        "4",
+    )
     .getOrCreate()
 )
 
@@ -98,14 +102,46 @@ spark.sparkContext.setLogLevel("WARN")
 
 event_schema = StructType(
     [
-        StructField("patient_id", StringType(), False),
-        StructField("heart_rate", IntegerType(), True),
-        StructField("spo2", DoubleType(), True),
-        StructField("systolic_bp", IntegerType(), True),
-        StructField("diastolic_bp", IntegerType(), True),
-        StructField("temperature", DoubleType(), True),
-        StructField("event_id", StringType(), False),
-        StructField("timestamp", StringType(), False),
+        StructField(
+            "patient_id",
+            StringType(),
+            False,
+        ),
+        StructField(
+            "heart_rate",
+            IntegerType(),
+            True,
+        ),
+        StructField(
+            "spo2",
+            DoubleType(),
+            True,
+        ),
+        StructField(
+            "systolic_bp",
+            IntegerType(),
+            True,
+        ),
+        StructField(
+            "diastolic_bp",
+            IntegerType(),
+            True,
+        ),
+        StructField(
+            "temperature",
+            DoubleType(),
+            True,
+        ),
+        StructField(
+            "event_id",
+            StringType(),
+            False,
+        ),
+        StructField(
+            "timestamp",
+            StringType(),
+            False,
+        ),
     ]
 )
 
@@ -298,6 +334,133 @@ deduplicated_stream = (
 
 
 # ============================================================
+# RAW VITALS → PostgreSQL
+# ============================================================
+
+def write_raw_vitals_to_postgres(
+    batch_df,
+    batch_id,
+):
+    rows = batch_df.collect()
+
+    if not rows:
+        return
+
+    connection = None
+
+    try:
+
+        connection = psycopg2.connect(
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+            dbname=POSTGRES_DB,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+        )
+
+        cursor = connection.cursor()
+
+        ingested_at = datetime.now(
+            timezone.utc
+        ).replace(
+            tzinfo=None
+        )
+
+        inserted_count = 0
+
+        for row in rows:
+
+            cursor.execute(
+                """
+                INSERT INTO raw_vitals (
+                    event_id,
+                    patient_id,
+                    heart_rate,
+                    spo2,
+                    systolic_bp,
+                    diastolic_bp,
+                    temperature,
+                    event_ts,
+                    ingested_at
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                )
+                ON CONFLICT (event_id)
+                DO NOTHING;
+                """,
+                (
+                    row["event_id"],
+                    row["patient_id"],
+                    row["heart_rate"],
+                    row["spo2"],
+                    row["systolic_bp"],
+                    row["diastolic_bp"],
+                    row["temperature"],
+                    row["event_timestamp"],
+                    ingested_at,
+                ),
+            )
+
+            if cursor.rowcount == 1:
+                inserted_count += 1
+
+        connection.commit()
+
+        print(
+            f"PostgreSQL raw batch {batch_id}: "
+            f"inserted {inserted_count} raw vital rows"
+        )
+
+    except Exception as exc:
+
+        if connection:
+            connection.rollback()
+
+        print(
+            f"PostgreSQL raw batch {batch_id} failed: "
+            f"{exc}"
+        )
+
+        raise
+
+    finally:
+
+        if connection:
+            connection.close()
+
+
+# ============================================================
+# Write Accepted Raw Events to PostgreSQL
+# ============================================================
+
+raw_vitals_query = (
+    deduplicated_stream
+    .writeStream
+    .outputMode("append")
+    .foreachBatch(
+        write_raw_vitals_to_postgres
+    )
+    .option(
+        "checkpointLocation",
+        "spark/checkpoints/raw-vitals",
+    )
+    .trigger(
+        processingTime="5 seconds"
+    )
+    .start()
+)
+
+
+# ============================================================
 # Abnormality Detection
 # ============================================================
 
@@ -412,6 +575,7 @@ def write_to_postgres(
     connection = None
 
     try:
+
         connection = psycopg2.connect(
             host=POSTGRES_HOST,
             port=POSTGRES_PORT,
@@ -425,15 +589,34 @@ def write_to_postgres(
         for row in rows:
 
             patient_id = row["patient_id"]
-            window_start = row["window"]["start"]
-            window_end = row["window"]["end"]
 
-            avg_hr = row["avg_heart_rate"]
-            avg_spo2 = row["avg_spo2"]
-            avg_temp = row["avg_temperature"]
+            window_start = row[
+                "window"
+            ]["start"]
 
-            abnormal_count = row["abnormal_count"]
-            risk_flag = row["risk_flag"]
+            window_end = row[
+                "window"
+            ]["end"]
+
+            avg_hr = row[
+                "avg_heart_rate"
+            ]
+
+            avg_spo2 = row[
+                "avg_spo2"
+            ]
+
+            avg_temp = row[
+                "avg_temperature"
+            ]
+
+            abnormal_count = row[
+                "abnormal_count"
+            ]
+
+            risk_flag = row[
+                "risk_flag"
+            ]
 
             # ------------------------------------------------
             # Insert realtime trend
@@ -567,4 +750,4 @@ postgres_query = (
 # Wait for Streaming Queries
 # ============================================================
 
-postgres_query.awaitTermination()
+spark.streams.awaitAnyTermination()

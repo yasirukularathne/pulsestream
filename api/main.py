@@ -1,6 +1,14 @@
 from datetime import date
 
 from fastapi import FastAPI, Query
+from fastapi.responses import Response
+
+from prometheus_client import (
+    Counter,
+    Gauge,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+)
 
 from api.database import get_db_connection
 
@@ -12,6 +20,37 @@ app = FastAPI(
 )
 
 
+# ---------------------------------------------------------
+# Prometheus Metrics
+# ---------------------------------------------------------
+
+api_requests_total = Counter(
+    "pulsestream_api_requests_total",
+    "Total number of API requests",
+)
+
+active_patients_metric = Gauge(
+    "pulsestream_active_patients",
+    "Number of active patients",
+)
+
+
+# ---------------------------------------------------------
+# Prometheus Metrics Endpoint
+# ---------------------------------------------------------
+
+@app.get("/metrics")
+def metrics():
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
+
+
+# ---------------------------------------------------------
+# Health Check
+# ---------------------------------------------------------
+
 @app.get("/health")
 def health_check():
     return {
@@ -20,10 +59,19 @@ def health_check():
     }
 
 
+# ---------------------------------------------------------
+# Daily Risk
+# ---------------------------------------------------------
+
 @app.get("/daily-risk")
 def get_daily_risk(
-    sim_date: date = Query(..., description="Simulation date in YYYY-MM-DD format")
+    sim_date: date = Query(
+        ...,
+        description="Simulation date in YYYY-MM-DD format",
+    )
 ):
+    api_requests_total.inc()
+
     conn = get_db_connection()
 
     try:
@@ -65,8 +113,15 @@ def get_daily_risk(
     finally:
         conn.close()
 
+
+# ---------------------------------------------------------
+# Patient Realtime Trends
+# ---------------------------------------------------------
+
 @app.get("/patients/{patient_id}/trends")
 def get_patient_trends(patient_id: str):
+    api_requests_total.inc()
+
     conn = get_db_connection()
 
     try:
@@ -99,9 +154,21 @@ def get_patient_trends(patient_id: str):
                     "patient_id": row[0],
                     "window_start": row[1],
                     "window_end": row[2],
-                    "avg_hr": float(row[3]) if row[3] is not None else None,
-                    "avg_spo2": float(row[4]) if row[4] is not None else None,
-                    "avg_temp": float(row[5]) if row[5] is not None else None,
+                    "avg_hr": (
+                        float(row[3])
+                        if row[3] is not None
+                        else None
+                    ),
+                    "avg_spo2": (
+                        float(row[4])
+                        if row[4] is not None
+                        else None
+                    ),
+                    "avg_temp": (
+                        float(row[5])
+                        if row[5] is not None
+                        else None
+                    ),
                     "abnormal_count": row[6],
                     "risk_flag_realtime": row[7],
                 }
@@ -112,12 +179,20 @@ def get_patient_trends(patient_id: str):
     finally:
         conn.close()
 
+
+# ---------------------------------------------------------
+# Patient Risk
+# ---------------------------------------------------------
+
 @app.get("/patients/{patient_id}/risk")
 def get_patient_risk(patient_id: str):
+    api_requests_total.inc()
+
     conn = get_db_connection()
 
     try:
         with conn.cursor() as cursor:
+
             # Latest realtime risk
             cursor.execute(
                 """
@@ -136,7 +211,7 @@ def get_patient_risk(patient_id: str):
 
             realtime_row = cursor.fetchone()
 
-            # Latest daily operational risk
+            # Latest daily risk
             cursor.execute(
                 """
                 SELECT
@@ -157,6 +232,7 @@ def get_patient_risk(patient_id: str):
 
         return {
             "patient_id": patient_id,
+
             "realtime": (
                 {
                     "risk_flag": realtime_row[0],
@@ -167,6 +243,7 @@ def get_patient_risk(patient_id: str):
                 if realtime_row
                 else None
             ),
+
             "daily": (
                 {
                     "sim_date": daily_row[0],
@@ -183,8 +260,15 @@ def get_patient_risk(patient_id: str):
     finally:
         conn.close()
 
+
+# ---------------------------------------------------------
+# Alerts
+# ---------------------------------------------------------
+
 @app.get("/alerts")
 def get_alerts():
+    api_requests_total.inc()
+
     conn = get_db_connection()
 
     try:
@@ -224,20 +308,33 @@ def get_alerts():
 
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------
+# KPIs
+# ---------------------------------------------------------
+
 @app.get("/kpis")
 def get_kpis():
+    api_requests_total.inc()
+
     conn = get_db_connection()
 
     try:
         with conn.cursor() as cursor:
-            # Active patients from the patient registry
+
+            # Active patients
             cursor.execute(
                 """
                 SELECT COUNT(*)
                 FROM patients;
                 """
             )
+
             active_patients = cursor.fetchone()[0]
+
+            # Update Prometheus gauge
+            active_patients_metric.set(active_patients)
 
             # Latest realtime risk per patient
             cursor.execute(
@@ -250,12 +347,16 @@ def get_kpis():
                     FROM vitals_trends
                     ORDER BY patient_id, window_end DESC
                 ) latest
-                WHERE risk_flag_realtime IN ('watch', 'elevated');
+                WHERE risk_flag_realtime IN (
+                    'watch',
+                    'elevated'
+                );
                 """
             )
+
             watch_or_elevated_patients = cursor.fetchone()[0]
 
-            # Currently unresolved alerts
+            # Active alerts
             cursor.execute(
                 """
                 SELECT COUNT(*)
@@ -263,11 +364,15 @@ def get_kpis():
                 WHERE resolved_at IS NULL;
                 """
             )
+
             active_alerts = cursor.fetchone()[0]
 
         risk_percentage = (
             round(
-                (watch_or_elevated_patients / active_patients) * 100,
+                (
+                    watch_or_elevated_patients
+                    / active_patients
+                ) * 100,
                 2,
             )
             if active_patients > 0
@@ -276,9 +381,61 @@ def get_kpis():
 
         return {
             "active_patients": active_patients,
-            "watch_or_elevated_patients": watch_or_elevated_patients,
+            "watch_or_elevated_patients": (
+                watch_or_elevated_patients
+            ),
             "risk_percentage": risk_percentage,
             "active_alerts": active_alerts,
+        }
+
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------
+# Pipeline Health
+# ---------------------------------------------------------
+
+@app.get("/pipeline-health")
+def get_pipeline_health():
+    api_requests_total.inc()
+
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    dag_id,
+                    run_id,
+                    status,
+                    started_at,
+                    ended_at,
+                    records_processed,
+                    records_rejected
+                FROM pipeline_runs
+                ORDER BY started_at DESC
+                LIMIT 10;
+                """
+            )
+
+            rows = cursor.fetchall()
+
+        return {
+            "count": len(rows),
+            "runs": [
+                {
+                    "dag_id": row[0],
+                    "run_id": row[1],
+                    "status": row[2],
+                    "started_at": row[3],
+                    "ended_at": row[4],
+                    "records_processed": row[5],
+                    "records_rejected": row[6],
+                }
+                for row in rows
+            ],
         }
 
     finally:

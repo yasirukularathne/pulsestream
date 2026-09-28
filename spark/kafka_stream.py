@@ -688,6 +688,14 @@ def write_to_postgres(
                         %s,
                         %s
                     )
+                    ON CONFLICT (
+                        patient_id,
+                        rule_triggered,
+                        severity,
+                        triggered_at,
+                        source_layer
+                    )
+                    DO NOTHING
                     """,
                     (
                         patient_id,
